@@ -1,0 +1,144 @@
+name: Salesforce Sequential Plan Execution
+
+on:
+  schedule:
+    - cron: '30 0 * * *'
+  workflow_dispatch:
+
+env:
+  API_BASE: https://api-app2.virtuoso.qa/api
+
+jobs:
+  execute-plans:
+    name: Execute Salesforce Plans Sequentially
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate token
+        run: |
+          if [ -z "${{ secrets.VIRTUOSO_TOKEN }}" ]; then
+            echo "::error::VIRTUOSO_TOKEN secret is not set."
+            exit 1
+          fi
+
+      - name: Run all plans sequentially
+        env:
+          TOKEN: ${{ secrets.VIRTUOSO_TOKEN }}
+        run: |
+          set -eou pipefail
+
+          declare -a PLAN_IDS=(1917 1918 1919 1920 1921 1922)
+          declare -a PLAN_NAMES=(
+            "SF 1 of 6 - Logging in and First Navigation Steps"
+            "SF 2 of 6 - Account Module - Create Account & Opportunity via the UI"
+            "SF 3 of 6 - Account Module- Create Account & Opportunity via API"
+            "SF 4 of 6 - Create Account & Contact via the API"
+            "SF - 5 of 6 - Service Module - Create Account, Contact, Case and Edit Case Status"
+            "SF 6 of 6 - Account Module - Lead Creation, Updates and Lead Conversion"
+          )
+
+          ALL_SUCCESS=true
+          PLAN_EXECUTION_IDS=()
+          TOTAL=${#PLAN_IDS[@]}
+
+          for i in "${!PLAN_IDS[@]}"; do
+            PLAN_ID=${PLAN_IDS[$i]}
+            PLAN_NAME=${PLAN_NAMES[$i]}
+            INDEX=$((i + 1))
+
+            echo "========================================"
+            echo "[$INDEX/$TOTAL] Executing: $PLAN_NAME (ID: $PLAN_ID)"
+            echo "========================================"
+
+            # Launch plan
+            JOBS=$(curl -s \
+              --header "Authorization: Bearer $TOKEN" \
+              --header "X-Virtuoso-Client-Name: CICD" \
+              -X POST \
+              "$API_BASE/plans/executions/$PLAN_ID/execute?envelope=false")
+
+            if [ -z "$JOBS" ] || [ "$JOBS" == "null" ]; then
+              echo "::error::Failed to launch plan $PLAN_ID ($PLAN_NAME)"
+              ALL_SUCCESS=false
+              continue
+            fi
+
+            JOB_IDS=$(echo "$JOBS" | jq -r ".jobs|.[]|.id" | tr '\n' ' ')
+            PLAN_EXECUTION_ID=$(echo "$JOBS" | jq -r ".id")
+            PLAN_EXECUTION_IDS+=("$PLAN_EXECUTION_ID")
+
+            if [ -z "$JOB_IDS" ]; then
+              echo "::error::No jobs returned for plan $PLAN_ID"
+              ALL_SUCCESS=false
+              continue
+            fi
+
+            echo "Plan execution ID: $PLAN_EXECUTION_ID"
+            echo "Jobs: $JOB_IDS"
+
+            # Poll all jobs to completion
+            for JOB_ID in $JOB_IDS; do
+              echo "Polling job $JOB_ID..."
+              while true; do
+                JOB=$(curl -s \
+                  --header "Authorization: Bearer $TOKEN" \
+                  --header "X-Virtuoso-Client-Name: CICD" \
+                  "$API_BASE/executions/$JOB_ID/status?envelope=false" || echo "{}")
+
+                JOB_STATUS=$(echo "$JOB" | jq -r .status)
+                OUTCOME=$(echo "$JOB" | jq -r .outcome)
+
+                echo "  Job $JOB_ID: status=$JOB_STATUS outcome=$OUTCOME"
+
+                if [[ "$JOB_STATUS" == "FINISHED" || "$JOB_STATUS" == "CANCELED" || "$JOB_STATUS" == "FAILED" ]]; then
+                  if [[ "$OUTCOME" == "FAIL" || "$OUTCOME" == "ERROR" ]]; then
+                    ALL_SUCCESS=false
+                    echo "::warning::Job $JOB_ID in plan \"$PLAN_NAME\" ended with outcome: $OUTCOME"
+                  fi
+                  break
+                fi
+
+                sleep 5
+              done
+            done
+
+            echo "[$INDEX/$TOTAL] Completed: $PLAN_NAME"
+
+            # Wait 60 seconds before launching the next plan (skip after last)
+            if [ "$INDEX" -lt "$TOTAL" ]; then
+              echo "Waiting 60 seconds before next plan..."
+              sleep 60
+            fi
+          done
+
+          # Export results for all plan executions
+          echo "========================================"
+          echo "Exporting results..."
+          echo "========================================"
+
+          RESULTS="[]"
+          for EXEC_ID in "${PLAN_EXECUTION_IDS[@]}"; do
+            REPORT=$(curl -s \
+              --header "Authorization: Bearer $TOKEN" \
+              --header "X-Virtuoso-Client-Name: CICD" \
+              "$API_BASE/plans/executions/status/$EXEC_ID?envelope=false" || echo "{}")
+            RESULTS=$(echo "$RESULTS" | jq --argjson r "$REPORT" '. + [$r]')
+          done
+
+          echo "$RESULTS" | jq '.' > plan_execution_reports.json
+          echo "Exported combined report as plan_execution_reports.json"
+
+          if [ "$ALL_SUCCESS" = false ]; then
+            echo "::error::One or more plans had failures."
+            exit 2
+          fi
+
+          echo "All 6 plans finished successfully!"
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: salesforce-plan-execution-reports
+          path: plan_execution_reports.json
+          retention-days: 30
