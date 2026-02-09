@@ -1,6 +1,8 @@
 name: Virtuoso Plan Execution
 
 on:
+  schedule:
+    - cron: '30 0 * * *'
   workflow_dispatch:
     inputs:
       plan_id:
@@ -37,7 +39,7 @@ jobs:
             exit 1
           fi
 
-          if [ -z "${{ inputs.plan_id }}" ]; then
+          if [ -z "${{ inputs.plan_id || '1917' }}" ]; then
             echo "::error::plan_id is required."
             exit 1
           fi
@@ -47,8 +49,8 @@ jobs:
         run: |
           set -eou pipefail
 
-          PLAN_ID="${{ inputs.plan_id }}"
-          PLAN_NAME="${{ inputs.plan_name }}"
+          PLAN_ID="${{ inputs.plan_id || '1917' }}"
+          PLAN_NAME="${{ inputs.plan_name || 'Salesforce All Journeys' }}"
           ENVIRONMENT_ID="${{ inputs.environment_id }}"
           TOKEN="${{ secrets.VIRTUOSO_TOKEN }}"
 
