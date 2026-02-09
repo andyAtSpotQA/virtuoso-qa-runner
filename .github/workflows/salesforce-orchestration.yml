@@ -1,0 +1,140 @@
+name: Salesforce Orchestration
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+env:
+  API_BASE: https://api-app2.virtuoso.qa/api
+  ORCHESTRATION_ID: c1c9e92b-f4dd-48b3-932c-3e223909a025
+  ORCHESTRATION_NAME: Salesforce Orchestration
+  MAX_RETRY_TIME_SECONDS: 300
+  RETRY_DELAY_TIME_SECONDS: 10
+
+jobs:
+  execute-orchestration:
+    name: Execute Salesforce Orchestration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate token
+        run: |
+          if [ -z "${{ secrets.VIRTUOSO_TOKEN }}" ]; then
+            echo "::error::VIRTUOSO_TOKEN secret is not set."
+            exit 1
+          fi
+
+      - name: Launch orchestration
+        id: launch
+        env:
+          TOKEN: ${{ secrets.VIRTUOSO_TOKEN }}
+        run: |
+          set -eou pipefail
+
+          echo "Going to execute orchestration \"$ORCHESTRATION_NAME\""
+
+          ORCHESTRATION_EXECUTION_ID=$(curl -s \
+            --header "Authorization: Bearer $TOKEN" \
+            --header "X-Virtuoso-Client-Name: CICD" \
+            -X POST \
+            "$API_BASE/orchestrations/$ORCHESTRATION_ID/execute?envelope=false" | jq -r .id)
+
+          if [ -z "$ORCHESTRATION_EXECUTION_ID" ] || [ "$ORCHESTRATION_EXECUTION_ID" == "null" ]; then
+            echo "::error::Failed to launch orchestration execution."
+            exit 1
+          fi
+
+          echo "Launched orchestration execution: $ORCHESTRATION_EXECUTION_ID"
+          echo "execution_id=$ORCHESTRATION_EXECUTION_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Poll orchestration status
+        id: poll
+        env:
+          TOKEN: ${{ secrets.VIRTUOSO_TOKEN }}
+        run: |
+          set -ou pipefail
+
+          EXEC_ID="${{ steps.launch.outputs.execution_id }}"
+
+          echo "--------"
+          RUNNING=true
+          JOB_STATUS=""
+
+          while $RUNNING; do
+            RETRY_TIME=0
+            JOB=""
+
+            # Retry loop for transient API failures
+            while [ -z "$JOB" ]; do
+              JOB=$(curl -s --fail \
+                --header "Authorization: Bearer $TOKEN" \
+                --header "X-Virtuoso-Client-Name: CICD" \
+                "$API_BASE/orchestrations/executions/$EXEC_ID/details?envelope=false" || true)
+
+              if [ -z "$JOB" ]; then
+                if [ "$RETRY_TIME" -lt "$MAX_RETRY_TIME_SECONDS" ]; then
+                  echo "Request failed. Retrying..."
+                  RETRY_TIME=$((RETRY_TIME + RETRY_DELAY_TIME_SECONDS))
+                  sleep "$RETRY_DELAY_TIME_SECONDS"
+                else
+                  echo "::error::Failed to get orchestration status after ${MAX_RETRY_TIME_SECONDS}s of retries."
+                  exit 2
+                fi
+              fi
+            done
+
+            JOB_STATUS=$(echo "$JOB" | jq -r .status)
+
+            if [[ "$JOB_STATUS" == "FINISHED" || "$JOB_STATUS" == "CANCELED" || "$JOB_STATUS" == "FAILED" ]]; then
+              RUNNING=false
+              echo "--------"
+              echo "Orchestration \"$EXEC_ID\" executed with outcome \"$JOB_STATUS\""
+            else
+              echo "Orchestration execution is \"$JOB_STATUS\""
+              sleep 2
+            fi
+          done
+
+          echo "job_status=$JOB_STATUS" >> "$GITHUB_OUTPUT"
+
+      - name: Export report
+        if: always()
+        env:
+          TOKEN: ${{ secrets.VIRTUOSO_TOKEN }}
+        run: |
+          set -eou pipefail
+
+          EXEC_ID="${{ steps.launch.outputs.execution_id }}"
+
+          curl -s \
+            --header "Authorization: Bearer $TOKEN" \
+            --header "X-Virtuoso-Client-Name: CICD" \
+            "$API_BASE/orchestrations/executions/$EXEC_ID/details?envelope=false" \
+            | jq -r '.' > execution_report.json
+
+          echo "Exported report as \"execution_report.json\""
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orchestration-execution-report
+          path: execution_report.json
+          retention-days: 30
+
+      - name: Check results
+        run: |
+          JOB_STATUS="${{ steps.poll.outputs.job_status }}"
+
+          if [[ "$JOB_STATUS" == "FAILED" || "$JOB_STATUS" == "ERROR" ]]; then
+            echo "::error::Orchestration failed or errored."
+            exit 2
+          fi
+
+          if [ "$JOB_STATUS" != "FINISHED" ]; then
+            echo "::error::Orchestration did not finish successfully (status: $JOB_STATUS)."
+            exit 3
+          fi
+
+          echo "Done!"
