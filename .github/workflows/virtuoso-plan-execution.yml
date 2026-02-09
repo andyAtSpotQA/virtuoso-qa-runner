@@ -1,0 +1,162 @@
+name: Virtuoso Plan Execution
+
+on:
+  workflow_dispatch:
+    inputs:
+      plan_id:
+        description: "Virtuoso Plan ID"
+        required: true
+        default: "1917"
+      plan_name:
+        description: "Plan name (for logging)"
+        required: true
+        default: "Salesforce All Journeys"
+      environment_id:
+        description: "Virtuoso Environment ID (optional)"
+        required: false
+        default: ""
+      max_retry_time:
+        description: "Max retry time in seconds"
+        required: false
+        default: "300"
+      retry_delay_time:
+        description: "Retry delay time in seconds"
+        required: false
+        default: "10"
+
+jobs:
+  execute-plan:
+    name: Execute Virtuoso Plan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate inputs
+        run: |
+          if [ -z "${{ secrets.VIRTUOSO_TOKEN }}" ]; then
+            echo "::error::VIRTUOSO_TOKEN secret is not set. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          if [ -z "${{ inputs.plan_id }}" ]; then
+            echo "::error::plan_id is required."
+            exit 1
+          fi
+
+      - name: Launch plan execution
+        id: launch
+        run: |
+          set -eou pipefail
+
+          PLAN_ID="${{ inputs.plan_id }}"
+          PLAN_NAME="${{ inputs.plan_name }}"
+          ENVIRONMENT_ID="${{ inputs.environment_id }}"
+          TOKEN="${{ secrets.VIRTUOSO_TOKEN }}"
+
+          echo "Going to execute plan \"$PLAN_NAME\""
+
+          CURL_ARGS=(
+            -s
+            --header "Authorization: Bearer $TOKEN"
+            --header "X-Virtuoso-Client-Name: CICD"
+            -X POST
+          )
+
+          if [ -n "$ENVIRONMENT_ID" ]; then
+            echo "Using environment: $ENVIRONMENT_ID"
+            EXECUTION_BODY=$(jq -n --arg envId "$ENVIRONMENT_ID" '{ environmentId: $envId }')
+            CURL_ARGS+=(--header "Content-Type: application/json" -d "$EXECUTION_BODY")
+          fi
+
+          JOBS=$(curl "${CURL_ARGS[@]}" \
+            "https://api-app2.virtuoso.qa/api/plans/executions/$PLAN_ID/execute?envelope=false")
+
+          if [ -z "$JOBS" ] || [ "$JOBS" == "null" ]; then
+            echo "::error::Failed to launch plan execution."
+            exit 1
+          fi
+
+          JOB_IDS=$(echo "$JOBS" | jq -r ".jobs|.[]|.id" | tr '\n' ' ')
+          if [ -z "$JOB_IDS" ]; then
+            echo "::error::No jobs were returned from plan execution."
+            exit 1
+          fi
+
+          PLAN_EXECUTION_ID=$(echo "$JOBS" | jq -r ".id")
+
+          echo "Launched Plan execution: $PLAN_EXECUTION_ID"
+          echo "Launched jobs: $JOB_IDS"
+
+          echo "plan_execution_id=$PLAN_EXECUTION_ID" >> "$GITHUB_OUTPUT"
+          echo "job_ids=$JOB_IDS" >> "$GITHUB_OUTPUT"
+
+      - name: Poll job status
+        id: poll
+        run: |
+          set -eou pipefail
+
+          TOKEN="${{ secrets.VIRTUOSO_TOKEN }}"
+          JOB_IDS="${{ steps.launch.outputs.job_ids }}"
+
+          echo "--------"
+          ALL_SUCCESS=true
+
+          for JOB_ID in $JOB_IDS; do
+            echo "Polling job $JOB_ID..."
+            RUNNING=true
+
+            while $RUNNING; do
+              JOB=$(curl -s \
+                --header "Authorization: Bearer $TOKEN" \
+                --header "X-Virtuoso-Client-Name: CICD" \
+                "https://api-app2.virtuoso.qa/api/executions/$JOB_ID/status?envelope=false" || echo "{}")
+
+              JOB_STATUS=$(echo "$JOB" | jq -r .status)
+              OUTCOME=$(echo "$JOB" | jq -r .outcome)
+
+              echo "Job: $JOB_ID status is \"$JOB_STATUS\""
+
+              if [[ "$JOB_STATUS" == "FINISHED" || "$JOB_STATUS" == "CANCELED" || "$JOB_STATUS" == "FAILED" ]]; then
+                RUNNING=false
+                if [[ "$OUTCOME" == "FAIL" || "$OUTCOME" == "ERROR" ]]; then
+                  ALL_SUCCESS=false
+                fi
+              else
+                sleep 5
+              fi
+            done
+            echo "--------"
+          done
+
+          echo "all_success=$ALL_SUCCESS" >> "$GITHUB_OUTPUT"
+
+      - name: Export test results
+        run: |
+          set -eou pipefail
+
+          TOKEN="${{ secrets.VIRTUOSO_TOKEN }}"
+          PLAN_EXECUTION_ID="${{ steps.launch.outputs.plan_execution_id }}"
+
+          echo "Exporting test results..."
+
+          curl -s \
+            --header "Authorization: Bearer $TOKEN" \
+            --header "X-Virtuoso-Client-Name: CICD" \
+            "https://api-app2.virtuoso.qa/api/plans/executions/status/$PLAN_EXECUTION_ID?envelope=false" \
+            | jq -r '.' > plan_execution_report.json
+
+          echo "Exported the report as \"plan_execution_report.json\""
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: virtuoso-plan-execution-report
+          path: plan_execution_report.json
+          retention-days: 30
+
+      - name: Check results
+        run: |
+          if [ "${{ steps.poll.outputs.all_success }}" = "false" ]; then
+            echo "::error::One or more jobs failed or errored."
+            exit 2
+          fi
+          echo "All jobs finished successfully!"
